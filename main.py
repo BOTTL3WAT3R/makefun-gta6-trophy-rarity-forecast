@@ -9,30 +9,53 @@ from statistics import NormalDist
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
-# Persistence-anchored forecaster (v2).
+# Forecaster v3 — counts-space, law-selected, refresh-aware, damped.
 #
-# Design, driven by the server's practice verdict on v1: on the recorded
-# histories the earn rates barely move between reads, and the scoring is
-# pinball loss on the logit scale, where a small percentage-point miss near
-# p = 0 or p = 1 explodes. v1 moved its centre toward fitted growth /
-# dilution models and paid for that move at both ends. v2 therefore:
-#   * centres every trophy on its LAST OBSERVED rate, applying at most 5%
-#     of the recency-weighted fitted move (and exactly zero drift when the
-#     observed history is flat);
-#   * takes its spread from the history's own read-to-read logit noise,
-#     scaled like a random walk over the forecast gap, shrunk toward the
-#     cross-trophy pooled noise, inflated slightly for coverage, and held
-#     to a floor so flat histories still get tight, non-degenerate bands.
+# What the first two versions taught (server practice verdicts: v1 loss
+# 1.403, v2 loss 1.569, house persistence baseline ~1.51):
+#   * The kit practice histories are byte-identical stale snapshots: the
+#     page never refreshed inside either history, and the scored answers
+#     are the refreshed page. No law can be selected from those histories;
+#     they contain zero within-history signal.
+#   * The case that pays, f00, is the opposite regime: ~2 days of reads
+#     every 10 minutes with real movement, and a 4.52-day horizon. There
+#     the signal is the joint growth of players_tracked and per-trophy
+#     earners, so v3 forecasts the two counts separately and divides.
+#
+# Design:
+#   * Collapse the history to distinct page states (Exophase refreshes on
+#     its own clock; consecutive identical reads are one observation).
+#   * Three candidate laws for the median: persistence; a logit-rate line
+#     on ln(1 + hours since release) (the house curve's shape, undamped);
+#     and a counts model — log players on ln(1 + hours), per-trophy log
+#     earners on ln(1 + hours) with slopes shrunk to the pooled slope.
+#   * Choose the law by rolling-origin backtest inside the case's own
+#     history (pooled across trophies; per-trophy override only on a
+#     clear backtest win). With too few distinct states to backtest, fall
+#     back to persistence with a wide, refresh-aware spread: a flat page
+#     is a stale page, and the truth has been moving unobserved.
+#   * DAMP the chosen law's move: the median takes only DAMP of the
+#     law's logit distance from the last rate, capped at MOVE_CAP. A
+#     regime tournament over synthetic saturating / growing / diluting
+#     worlds showed the undamped law wins big when the world is exactly
+#     its shape and loses catastrophically when growth saturates;
+#     damping keeps most of the win and removes the blow-up.
+#   * Spread from the chosen law's backtest residuals (random-walk scaled
+#     to the forecast gap, shrunk to the pooled residual), floored at
+#     SIGMA_FLOOR_B * sqrt(horizon days): a 4.5-day horizon is never
+#     forecast tighter than that, whatever the in-window fit says.
 
-EPS = 1e-6               # probability clip before any logit transform
-DRIFT_KEEP = 0.05        # fraction of the fitted move applied to q50
-DRIFT_CAP = 0.10         # absolute cap on the applied drift (logit units)
-SIGMA_FLOOR = 0.04       # minimum predictive spread (logit units)
-SIGMA_INFLATE = 1.15     # coverage inflation on the noise-based spread
-POOL_K = 4.0             # shrinkage weight toward the pooled noise estimate
-HALF_LIFE_H = 12.0       # recency half-life for the trend fit (hours)
-MOVE_WIDEN = 0.85        # band also covers the fitted move we chose not to centre
-MOVE_CAP = 2.0           # cap on the fitted move used for widening (logit units)
+EPS = 1e-6                # probability clip before any logit transform
+ANCHOR = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)  # release, house curve's origin
+FLAT_SIGMA = 0.60         # spread when the page never refreshed in-window (stale page)
+DAMP = 0.40               # fraction of the chosen law's logit move the median takes
+MOVE_CAP = 1.0            # max |logit move| of the law before damping
+SIGMA_FLOOR_A = 0.06      # horizon floor: sigma >= A + B * sqrt(horizon days)
+SIGMA_FLOOR_B = 0.16
+SIGMA_HARD_FLOOR_B = 0.40 # sigma >= B * sqrt(horizon days), whatever the fit says
+SIGMA_CAP = 1.60
+POOL_K = 4.0              # shrinkage weight toward pooled estimates
+OVERRIDE_RATIO = 0.80     # per-trophy law override needs a clear backtest win
 DEFAULT_LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 
 _NORM = NormalDist()
@@ -89,132 +112,275 @@ def median(vals):
     return 0.5 * (s[n // 2 - 1] + s[n // 2])
 
 
-def wls_line(xs, ys, ws):
-    """Weighted least squares y ~ a + b*x; returns (slope, slope SE) or None."""
-    sw = sum(ws)
-    if sw <= 0:
+def ols(xs, ys):
+    """Least squares y ~ a + b*x; returns (a, b) or None."""
+    n = len(xs)
+    if n < 2:
         return None
-    mx = sum(w * x for x, w in zip(xs, ws)) / sw
-    my = sum(w * y for y, w in zip(ys, ws)) / sw
-    sxx = sum(w * (x - mx) ** 2 for x, w in zip(xs, ws))
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
     if sxx <= 1e-12:
         return None
-    sxy = sum(w * (x - mx) * (y - my) for x, y, w in zip(xs, ys, ws))
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
     b = sxy / sxx
-    a = my - b * mx
-    s2 = sum(w * (y - (a + b * x)) ** 2 for x, y, w in zip(xs, ys, ws)) / sw
-    return b, math.sqrt(max(s2, 0.0) / sxx)
+    return (my - b * mx, b)
 
 
-def trophy_obs(case):
-    """Per-trophy list of (hours since first read, rate in percent), nulls dropped."""
-    history = case.get("history") or []
-    times = []
-    for read in history:
+def page_states(case):
+    """Collapse history to distinct page states.
+
+    A state is (x, players, rates) with x = ln(1 + hours since ANCHOR).
+    Consecutive reads with identical players and rates are one state:
+    the page only changes when Exophase refreshes it. Nulls inside a
+    read are kept as None; states are compared on their raw contents."""
+    states = []
+    for read in case.get("history") or []:
         try:
-            times.append(parse_ts(read["at"]))
+            t = parse_ts(read["at"])
         except Exception:
-            times.append(None)
-    valid = [t for t in times if t is not None]
-    t0 = valid[0] if valid else None
-    n_tr = len(case.get("trophies") or [])
-    obs = [[] for _ in range(n_tr)]
-    for read, t in zip(history, times):
-        if t is None or t0 is None:
             continue
+        players = read.get("players_tracked")
         rates = read.get("rates") or []
-        h = (t - t0).total_seconds() / 3600.0
-        for i in range(min(n_tr, len(rates))):
-            r = rates[i]
-            if r is not None:
-                obs[i].append((h, float(r)))
-    return obs, times, t0
+        key = (players, tuple(rates))
+        if states and states[-1][3] == key:
+            continue
+        hours = max(0.0, (t - ANCHOR).total_seconds() / 3600.0)
+        states.append((math.log1p(hours), players, list(rates), key, hours))
+    return states
+
+
+def last_rate(states, i):
+    for st in reversed(states):
+        rates = st[2]
+        if i < len(rates) and rates[i] is not None:
+            return float(rates[i])
+    return None
+
+
+def law_persistence(states, i, x_t):
+    r = last_rate(states, i)
+    return r
+
+
+def law_logit_trend(states, i, x_t):
+    """Logit-rate line on ln(1 + hours since release), undamped.
+
+    Uses states from the last 24 hours of recorded time when at least 3
+    usable points remain there, else all states (the house curve's
+    window). Falls back to persistence when the line is not fittable."""
+    pts = []
+    for st in states:
+        rates = st[2]
+        if i < len(rates) and rates[i] is not None:
+            pts.append((st[0], logit_prob(float(rates[i]) / 100.0), st[4]))
+    if len(pts) < 3:
+        return law_persistence(states, i, x_t)
+    h_last = pts[-1][2]
+    recent = [(x, y) for x, y, h in pts if h_last - h <= 24.0]
+    use = recent if len(recent) >= 3 else [(x, y) for x, y, _ in pts]
+    if len({y for _, y in use}) < 2:
+        return law_persistence(states, i, x_t)
+    fit = ols([x for x, _ in use], [y for _, y in use])
+    if fit is None:
+        return law_persistence(states, i, x_t)
+    a, b = fit
+    return inv_logit_pct(a + b * x_t)
+
+
+def players_forecast(states, x_t):
+    """Power-law players growth: OLS of ln players on ln(1 + hours)."""
+    pts = [(st[0], math.log(st[1])) for st in states if st[1]]
+    if len(pts) < 2:
+        return float(states[-1][1]) if states and states[-1][1] else None
+    fit = ols([x for x, _ in pts], [y for _, y in pts])
+    if fit is None:
+        return float(states[-1][1])
+    a, b = fit
+    return math.exp(a + b * x_t)
+
+
+def law_counts(states, i, x_t, pooled_slope):
+    """Forecast earners and players separately; rate = 100 * E / P.
+
+    Earners are cumulative counts: e = rate * players / 100. Per-trophy
+    OLS of ln(max(e, 0.25)) on ln(1 + hours), the slope shrunk toward
+    the pooled cross-trophy slope (small-count trophies pool hardest)."""
+    p_hat = players_forecast(states, x_t)
+    r_last = last_rate(states, i)
+    if p_hat is None or p_hat <= 0:
+        return r_last
+    pts = []
+    for st in states:
+        rates = st[2]
+        if st[1] and i < len(rates) and rates[i] is not None:
+            e = float(rates[i]) * float(st[1]) / 100.0
+            pts.append((st[0], math.log(max(e, 0.25)), e))
+    if len(pts) < 2 or r_last is None:
+        return r_last
+    fit = ols([x for x, _, _ in pts], [y for _, y, _ in pts])
+    if fit is None:
+        return r_last
+    a, b = fit
+    e_last = pts[-1][2]
+    w = e_last / (e_last + 8.0)          # shrink small counts to the pool
+    b_shrunk = w * b + (1.0 - w) * pooled_slope
+    # Re-anchor the line at the last observed earners with the shrunk
+    # slope, so the level is the data's, not the fit's intercept drift.
+    x_last = pts[-1][0]
+    ln_e = math.log(max(e_last, 0.25)) + b_shrunk * (x_t - x_last)
+    e_hat = math.exp(ln_e)
+    e_hat = min(e_hat, p_hat)            # earners cannot exceed players
+    return 100.0 * e_hat / p_hat
+
+
+def pooled_earner_slope(states, n_tr):
+    slopes = []
+    for i in range(n_tr):
+        pts = []
+        for st in states:
+            rates = st[2]
+            if st[1] and i < len(rates) and rates[i] is not None:
+                e = float(rates[i]) * float(st[1]) / 100.0
+                pts.append((st[0], math.log(max(e, 0.25))))
+        if len(pts) >= 2:
+            fit = ols([x for x, _ in pts], [y for _, y in pts])
+            if fit is not None:
+                slopes.append(fit[1])
+    return median(slopes) if slopes else 0.0
+
+
+LAWS = ("persist", "trend", "counts")
+
+
+def law_predict(law, states, i, x_t, pooled_slope):
+    if law == "trend":
+        return law_logit_trend(states, i, x_t)
+    if law == "counts":
+        return law_counts(states, i, x_t, pooled_slope)
+    return law_persistence(states, i, x_t)
+
+
+def backtest(states, n_tr, pooled_slope):
+    """Rolling-origin backtest over distinct states.
+
+    Origins are states 2..S-2 (0-based, needs >= 2 fits points and a
+    following state to score); each law is fit on states up to the
+    origin and scored on the next state's rates, in logit space.
+    Returns (pooled_err, per_trophy_err, n_points) with errors as mean
+    |logit(y) - logit(pred)| per law; empty dicts when not runnable."""
+    S = len(states)
+    if S < 4:
+        return {}, {}, 0
+    pooled = {law: [] for law in LAWS}
+    per = {law: [[] for _ in range(n_tr)] for law in LAWS}
+    for origin in range(2, S - 1):
+        sub = states[: origin + 1]
+        nxt = states[origin + 1]
+        x_n = nxt[0]
+        sub_pool = pooled_earner_slope(sub, n_tr)
+        for law in LAWS:
+            for i in range(n_tr):
+                rates = nxt[2]
+                if i >= len(rates) or rates[i] is None:
+                    continue
+                pred = law_predict(law, sub, i, x_n, sub_pool)
+                if pred is None:
+                    continue
+                err = abs(logit_prob(float(rates[i]) / 100.0) - logit_prob(pred / 100.0))
+                pooled[law].append(err)
+                per[law][i].append(err)
+    pooled_err = {law: (sum(v) / len(v) if v else None) for law, v in pooled.items()}
+    per_err = {
+        law: [(sum(v) / len(v) if v else None) for v in per[law]] for law in LAWS
+    }
+    n_points = len(pooled[LAWS[0]])
+    return pooled_err, per_err, n_points
 
 
 def forecast_case(case):
     trophies = case["trophies"]
+    n_tr = len(trophies)
     levels = case.get("levels") or DEFAULT_LEVELS
     zs = [_NORM.inv_cdf(float(tau)) for tau in levels]
-    obs, times, t0 = trophy_obs(case)
+    states = page_states(case)
 
     try:
         target_ts = parse_ts(case["target"])
+        target_h = max(0.0, (target_ts - ANCHOR).total_seconds() / 3600.0)
     except Exception:
-        target_ts = None
-    if target_ts is not None and t0 is not None:
-        target_h = (target_ts - t0).total_seconds() / 3600.0
-    elif case.get("horizon_minutes") is not None and obs and any(obs):
-        last_h = max(o[-1][0] for o in obs if o)
-        target_h = last_h + float(case["horizon_minutes"]) / 60.0
-    else:
-        target_h = 0.0
+        last_h = states[-1][4] if states else 0.0
+        target_h = last_h + float(case.get("horizon_minutes") or 0) / 60.0
+    x_t = math.log1p(target_h)
+    horizon_days = max(0.0, float(case.get("horizon_minutes") or 0)) / 1440.0
 
-    # Per-trophy read-to-read logit noise, normalised per sqrt(hour) so it
-    # scales like a random walk over gaps of any length.
-    sigmas = []
-    for o in obs:
-        units = []
-        for (h1, r1), (h2, r2) in zip(o, o[1:]):
-            dt = h2 - h1
-            if dt > 1e-9:
-                d = logit_prob(r2 / 100.0) - logit_prob(r1 / 100.0)
-                units.append(d / math.sqrt(dt))
-        if units:
-            sigmas.append((math.sqrt(sum(u * u for u in units) / len(units)), len(units)))
-        else:
-            sigmas.append((None, 0))
-    pool_vals = [s for s, _ in sigmas if s is not None]
-    pool_sigma = median(pool_vals) if pool_vals else 0.0
+    pooled_slope = pooled_earner_slope(states, n_tr)
+    pooled_err, per_err, n_bt = backtest(states, n_tr, pooled_slope)
 
-    last_rates = [o[-1][1] if o else None for o in obs]
+    # Pooled law choice: lowest backtest error; ties break toward the
+    # counts model (the final's regime), then trend, then persistence.
+    best_law = "persist"
+    if n_bt > 0:
+        order = {"counts": 0, "trend": 1, "persist": 2}
+        cands = [(pooled_err[law], order[law], law) for law in LAWS if pooled_err.get(law) is not None]
+        if cands:
+            cands.sort()
+            best_law = cands[0][2]
+
+    last_rates = [last_rate(states, i) for i in range(n_tr)]
     known = [r for r in last_rates if r is not None]
     global_last = median(known) if known else 1.0
+    flat = len(states) <= 1
+
+    # Residual scale of the chosen law, for the spread: reuse the
+    # backtest errors (they are mean absolute logit errors; a normal's
+    # sigma is ~1.25x its mean absolute deviation), random-walk scaled
+    # from the backtest gap to this case's gap where both are known.
+    bt_sigma = None
+    if n_bt > 0 and pooled_err.get(best_law) is not None:
+        bt_sigma = 1.25 * pooled_err[best_law]
 
     rows = []
     for i, trophy in enumerate(trophies):
-        o = obs[i] if i < len(obs) else []
-        r_last = last_rates[i] if i < len(last_rates) else None
-        base_rate = r_last if r_last is not None else global_last
-        mu = logit_prob(base_rate / 100.0)
+        r_last = last_rates[i] if last_rates[i] is not None else global_last
 
-        last_h = o[-1][0] if o else (max((oo[-1][0] for oo in obs if oo), default=0.0))
-        gap_h = max(0.0, target_h - last_h)
+        law = best_law
+        if n_bt > 0 and per_err:
+            base_err = per_err.get(best_law, [None] * n_tr)[i]
+            if base_err is not None:
+                for other in LAWS:
+                    if other == best_law:
+                        continue
+                    e = per_err.get(other, [None] * n_tr)[i]
+                    if e is not None and e < OVERRIDE_RATIO * base_err:
+                        law = other
+                        break
 
-        # Drift: at most DRIFT_KEEP of the recency-weighted fitted move,
-        # capped, and exactly zero when the observed history is flat.
-        drift = 0.0
-        full_move = 0.0
-        se_move = 0.0
-        if len(o) >= 3 and len({r for _, r in o}) >= 2:
-            xs = [h for h, _ in o]
-            ys = [logit_prob(r / 100.0) for _, r in o]
-            ws = [0.5 ** ((last_h - h) / HALF_LIFE_H) for h in xs]
-            fit = wls_line(xs, ys, ws)
-            if fit is not None:
-                slope, se_slope = fit
-                full_move = slope * gap_h
-                se_move = se_slope * gap_h
-                drift = DRIFT_KEEP * full_move
-                drift = min(DRIFT_CAP, max(-DRIFT_CAP, drift))
-        mu += drift
+        pred = law_predict(law, states, i, x_t, pooled_slope)
+        if pred is None:
+            pred = r_last
+        # Damp the law's move toward persistence (see header): take only
+        # DAMP of its logit distance from the last rate, capped.
+        mu_last = logit_prob(r_last / 100.0)
+        move = logit_prob(pred / 100.0) - mu_last
+        move = max(-MOVE_CAP, min(MOVE_CAP, move))
+        mu = mu_last + DAMP * move
 
-        # Spread: own noise shrunk toward the pooled noise, random-walk
-        # scaled over the forecast gap and inflated; plus, in quadrature,
-        # the trend fit's own uncertainty over the gap and most of the
-        # fitted move we deliberately did not centre — so a genuinely
-        # trending series widens instead of being missed, while a flat
-        # history (both terms exactly zero) stays at the floor.
-        s_i, n_i = sigmas[i] if i < len(sigmas) else (None, 0)
-        if s_i is not None:
-            s_comb = (n_i * s_i + POOL_K * pool_sigma) / (n_i + POOL_K)
+        if flat:
+            sigma = max(FLAT_SIGMA, 0.5 * math.sqrt(horizon_days))
         else:
-            s_comb = pool_sigma
-        var = (SIGMA_INFLATE * s_comb * math.sqrt(gap_h)) ** 2
-        var += se_move * se_move
-        var += (MOVE_WIDEN * min(abs(full_move), MOVE_CAP)) ** 2
-        sigma = math.sqrt(var)
-        if sigma < SIGMA_FLOOR:
-            sigma = SIGMA_FLOOR
+            sigma = SIGMA_FLOOR_A + SIGMA_FLOOR_B * math.sqrt(horizon_days)
+            if bt_sigma is not None:
+                sigma = max(sigma, bt_sigma)
+            s_i = None
+            if n_bt > 0 and per_err:
+                e = per_err.get(law, [None] * n_tr)[i]
+                if e is not None:
+                    s_i = 1.25 * e
+            if s_i is not None:
+                sigma = (3.0 * s_i + POOL_K * sigma) / (3.0 + POOL_K)
+            sigma = max(sigma, SIGMA_HARD_FLOOR_B * math.sqrt(horizon_days))
+            sigma = min(max(sigma, SIGMA_FLOOR_A), SIGMA_CAP)
 
         qs = []
         for z in zs:
@@ -245,7 +411,7 @@ def fallback_case(case):
         mu = logit_prob(r / 100.0)
         qs = []
         for z in zs:
-            qs.append(finish_pct(inv_logit_pct(mu + z * SIGMA_FLOOR)))
+            qs.append(finish_pct(inv_logit_pct(mu + z * FLAT_SIGMA)))
         for j in range(1, len(qs)):
             if qs[j] < qs[j - 1]:
                 qs[j] = qs[j - 1]
